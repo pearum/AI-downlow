@@ -38,6 +38,45 @@ from .env import API_KEYS
 
 log = logging.getLogger(__name__)
 
+JS_RUNTIME_MISSING_MESSAGE = (
+    "YouTube requires a supported JavaScript runtime for full extraction. "
+    "Install Deno or configure a supported runtime (YTDLP_JS_RUNTIME)."
+)
+
+
+def log_exc_info(
+    stage: str, exc: Exception, platform: Platform, url: str
+) -> None:
+    """Log the COMPLETE original exception without masking it.
+
+    The UI may show a friendly message, but Debug Mode and the log file must
+    contain the real exception. Never include cookies, tokens or secrets.
+    """
+    log.error(
+        "[YT_ADAPTER] stage=%s exception_type=%s exception_message=%s "
+        "exception_repr=%s platform=%s url=%s",
+        stage,
+        type(exc).__name__,
+        str(exc)[:1000],
+        repr(exc)[:1000],
+        platform.value,
+        url,
+    )
+    cause = exc.__cause__
+    if cause is not None:
+        log.error(
+            "[YT_ADAPTER] caused_by=%s caused_by_message=%s",
+            type(cause).__name__,
+            str(cause)[:1000],
+        )
+    # Full traceback is only written in Debug Mode.
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            "[YT_ADAPTER] full traceback for stage=%s",
+            stage,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
 
 def _user_agent() -> str:
     return (
@@ -80,6 +119,20 @@ def _resolve_js_runtime() -> tuple[str, str] | None:
     return None
 
 
+def _require_js_runtime(platform: Platform, stage: str = "Extracting media") -> None:
+    """Raise a clear error when YouTube needs a JS runtime and none exists.
+
+    Without Deno/Node, yt-dlp cannot run the JavaScript challenges YouTube
+    requires for extraction, so silently continuing would only produce
+    confusing download failures later.
+    """
+    if platform != Platform.YOUTUBE:
+        return
+    if _resolve_js_runtime() is not None:
+        return
+    raise RuntimeError(JS_RUNTIME_MISSING_MESSAGE)
+
+
 def _is_playlist_url(url: str, platform: Platform) -> bool:
     """Best-effort guess whether a URL points at a collection, not a video.
 
@@ -117,11 +170,15 @@ def _build_yt_dlp_options(
 ) -> dict[str, Any]:
     """Shared yt-dlp options used consistently for extraction and download.
 
-    ``remote_components`` always advertises EJS support so yt-dlp can fetch
-    the challenge solver from GitHub when the bundled ``yt-dlp-ejs`` package
-    is not present. ``js_runtimes`` is only populated when a real JavaScript
-    runtime exists on this machine — an invalid runtime path is never placed
-    into the options.
+    Every call returns a FRESH options dictionary — nested mutable values are
+    never shared between requests.
+
+    ``remote_components``/``js_runtimes`` are only enabled for YouTube, where
+    the EJS challenge solver is actually relevant. TikTok and Facebook do not
+    get YouTube-specific options.
+
+    ``js_runtimes`` is only populated when a real JavaScript runtime exists on
+    this machine — an invalid runtime path is never placed into the options.
     """
     opts: dict[str, Any] = {
         "quiet": True,
@@ -135,15 +192,35 @@ def _build_yt_dlp_options(
         "nocheckcertificate": False,
         "cachedir": False,
         "logger": _YtLogger(),
-        "remote_components": {"ejs:github"},
     }
-    runtime = _resolve_js_runtime()
-    if runtime:
-        name, path = runtime
-        opts["js_runtimes"] = {name: {"path": path}}
+    if provider == "youtube":
+        opts["remote_components"] = {"ejs:github"}
+        runtime = _resolve_js_runtime()
+        if runtime:
+            name, path = runtime
+            opts["js_runtimes"] = {name: {"path": path}}
+        else:
+            log.warning(
+                "No supported JavaScript runtime detected; "
+                "YouTube challenge solving may be unavailable."
+            )
     api_key = API_KEYS.get(provider)
     if api_key:
         opts["extractor_args"] = {provider: {"api_key": [api_key]}}
+    return opts
+
+
+def _build_extract_options(provider: str) -> dict[str, Any]:
+    """Fresh options for a metadata-only extraction (no media download)."""
+    opts = _build_yt_dlp_options(provider, download=False, playlist=True)
+    opts["extract_flat"] = "in_playlist"
+    return opts
+
+
+def _build_download_options(provider: str) -> dict[str, Any]:
+    """Fresh options for an actual media download."""
+    opts = _build_yt_dlp_options(provider, download=True, playlist=False)
+    opts["noprogress"] = True
     return opts
 
 
@@ -247,16 +324,24 @@ def extract_info(
     yt = _resolve_download_backend()
     if playlist is None:
         playlist = _is_playlist_url(url, platform)
-    opts = _build_yt_dlp_options(platform.value, download=download, playlist=playlist)
-    if not download:
-        opts["extract_flat"] = "in_playlist"
+    _require_js_runtime(platform, stage="Extracting media")
+    if download:
+        opts = _build_download_options(platform.value)
+    else:
+        opts = _build_extract_options(platform.value)
+        if not playlist:
+            opts["noplaylist"] = True
     try:
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=download)
     except yt.utils.DownloadError as exc:
+        log_exc_info("Extracting media", exc, platform, url)
         raise _translate_download_error(exc, stage="Extracting media") from exc
     except Exception as exc:  # noqa: BLE001
-        raise NetworkError(detail=str(exc), stage="Extracting media") from exc
+        log_exc_info("Extracting media", exc, platform, url)
+        if isinstance(exc, AppError):
+            raise
+        raise _translate_download_error(exc, stage="Extracting media") from exc
 
 
 def extract_playlist_page(
@@ -269,17 +354,20 @@ def extract_playlist_page(
     pagination — no synthetic tokens are invented.
     """
     yt = _resolve_download_backend()
-    opts = _build_yt_dlp_options(platform.value, download=False, playlist=True)
-    opts["extract_flat"] = "in_playlist"
+    opts = _build_extract_options(platform.value)
     if count and count > 0:
         opts["playlist_items"] = f"{start + 1}-{start + count}"
     try:
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
     except yt.utils.DownloadError as exc:
+        log_exc_info("Extracting media", exc, platform, url)
         raise _translate_download_error(exc, stage="Extracting media") from exc
     except Exception as exc:  # noqa: BLE001
-        raise NetworkError(detail=str(exc), stage="Extracting media") from exc
+        log_exc_info("Extracting media", exc, platform, url)
+        if isinstance(exc, AppError):
+            raise
+        raise _translate_download_error(exc, stage="Extracting media") from exc
 
 
 def _translate_download_error(
@@ -318,7 +406,10 @@ def _translate_download_error(
 
         return RateLimitError(detail=str(exc), stage=stage)
     if (
-        "video unavailable" in text
+        "http error 404" in text
+        or "http 404" in text
+        or "404:" in text
+        or "video unavailable" in text
         or "removed" in text
         or "not available" in text
         or "deleted" in text
@@ -327,6 +418,32 @@ def _translate_download_error(
         from ...core.errors import ContentUnavailableError
 
         return ContentUnavailableError(detail=str(exc), stage=stage)
+    if (
+        "cannot parse data" in text
+        or "extractor failure" in text
+        or "failed to parse" in text
+        or "unable to extract" in text
+        or "unsupported url" in text
+        or "not a valid url" in text
+        or "unknown url type" in text
+        or "unexpected response from webpage request" in text
+    ):
+        if "unsupported url" in text or "not a valid url" in text:
+            return URLError(detail=str(exc), stage=stage)
+        if "unexpected response from webpage request" in text:
+            message = (
+                "TikTok extraction is currently unavailable with the "
+                "installed downloader backend. The platform response is "
+                "incompatible with the current TikTok extractor."
+                if "tiktok" in text
+                else "Extraction is currently unavailable with the installed "
+                "downloader backend. The platform response is incompatible "
+                "with the current extractor."
+            )
+            return MetadataError(message, detail=str(exc), stage=stage)
+        from ...core.errors import MetadataError
+
+        return MetadataError(detail=str(exc), stage=stage)
     if "ffmpeg is not installed" in text or "requested merging of multiple formats" in text:
         from ...core.errors import FFmpegNotFoundError
 
@@ -338,9 +455,36 @@ def _translate_download_error(
         from ...core.errors import MergeError
 
         return MergeError(detail=str(exc), stage=stage)
-    if "unsupported url" in text or "not a valid url" in text:
-        return URLError(detail=str(exc), stage=stage)
-    return NetworkError(detail=str(exc), stage=stage)
+    # Only classify as a network error when the message actually indicates a
+    # network problem. Dependency, configuration, JS-runtime and extractor
+    # failures must NOT be hidden behind "A network error occurred...".
+    if any(
+        signal in text
+        for signal in (
+            "timeout",
+            "timed out",
+            "connection",
+            "reset",
+            "reset by peer",
+            "getaddrinfo",
+            "resolve",
+            "dns",
+            "ssl",
+            "tls",
+            "certificate",
+            "handshake",
+            "unable to download",
+            "could not connect",
+            "no route to host",
+            "network",
+        )
+    ):
+        return NetworkError(detail=str(exc), stage=stage)
+    return MetadataError(
+        "Could not fetch information for this URL.",
+        detail=str(exc),
+        stage=stage,
+    )
 
 
 def _build_format(f: dict[str, Any], item_id: str) -> MediaFormat:
@@ -565,13 +709,12 @@ class StreamDownloader:
         detected = detect_platform(self.url)
         provider = detected.value if detected != _Platform.UNKNOWN else ""
 
-        opts: dict[str, Any] = _build_yt_dlp_options(
-            provider, download=True, playlist=False
-        )
+        _require_js_runtime(detected, stage="Downloading")
+
+        opts: dict[str, Any] = _build_download_options(provider)
         opts["outtmpl"] = {"default": target}
         opts["format"] = format_selector
         opts["merge_output_format"] = _merge_ext(self.output_format)
-        opts["noprogress"] = True
         if ffmpeg:
             opts["ffmpeg_location"] = str(Path(ffmpeg).parent)
         if self.embed_metadata:
@@ -612,11 +755,13 @@ class StreamDownloader:
                     )
                 return self._final_path(target, info, ydl)
         except yt.utils.DownloadError as exc:
+            log_exc_info("Downloading", exc, detected, self.url)
             raise _translate_download_error(exc, stage="Downloading") from exc
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, AppError):
                 raise
-            raise NetworkError(detail=str(exc), stage="Downloading") from exc
+            log_exc_info("Downloading", exc, detected, self.url)
+            raise _translate_download_error(exc, stage="Downloading") from exc
 
     def _emit_from_hook(self, d: dict[str, Any]) -> None:
         if d.get("status") == "downloading":

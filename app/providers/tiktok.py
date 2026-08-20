@@ -239,6 +239,11 @@ class TikTokProvider(BaseProvider):
                     detail=f"{_ACCESS_UNAVAILABLE_DETAIL}\nReason: {reason}",
                     stage=exc.stage or "Extracting media",
                 )
+            if isinstance(exc, NetworkError):
+                # A generic NetworkError can still carry the real yt-dlp
+                # message in `detail`; surface the actual failure instead of
+                # letting "A network error occurred..." hide it.
+                return TikTokProvider._refine_network_error(exc, text)
             return exc
         message = str(exc).strip() or fallback or exc.__class__.__name__
         text = message.lower()
@@ -249,6 +254,65 @@ class TikTokProvider(BaseProvider):
                 stage="Extracting media",
             )
         return BaseProvider.translate_error(exc, fallback)
+
+    @staticmethod
+    def _refine_network_error(exc: AppError, text: str) -> AppError:
+        """Re-classify a generic NetworkError from its technical detail."""
+        stage = exc.stage or "Extracting media"
+        if any(s in text for s in ("timeout", "timed out", "timed-out")):
+            return NetworkError(
+                f"TikTok request timed out. {exc.detail or ''}".strip(),
+                detail=exc.detail or "",
+                stage=stage,
+            )
+        if any(s in text for s in ("getaddrinfo", "name resolution", "failed to resolve")):
+            return NetworkError(
+                "TikTok could not be reached.",
+                detail=f"DNS resolution failed.\n{exc.detail or ''}",
+                stage=stage,
+            )
+        if any(s in text for s in ("ssl", "tls", "certificate", "handshake")):
+            return NetworkError(
+                "A secure connection to TikTok could not be established.",
+                detail=exc.detail or "",
+                stage=stage,
+            )
+        if "http error 401" in text or "http 401" in text:
+            return AuthenticationError(detail=exc.detail or "", stage=stage)
+        if "http error 403" in text or "http 403" in text or "403" in text:
+            return PermissionDeniedError(
+                _ACCESS_UNAVAILABLE_MESSAGE,
+                detail=f"{_ACCESS_UNAVAILABLE_DETAIL}\nHTTP 403 during {stage}.",
+                stage=stage,
+            )
+        if "http error 404" in text or "http 404" in text or "404" in text:
+            return ContentUnavailableError(detail=exc.detail or "", stage=stage)
+        if "429" in text or "rate limit" in text or "too many" in text:
+            return RateLimitError(detail=exc.detail or "", stage=stage)
+        if "unexpected response from webpage request" in text:
+            return MetadataError(
+                "TikTok extraction is currently unavailable with the "
+                "installed downloader backend. The platform response is "
+                "incompatible with the current TikTok extractor.",
+                detail=exc.detail or "",
+                stage=stage,
+            )
+        if any(
+            s in text
+            for s in ("cannot parse data", "extractor failure", "unable to extract")
+        ):
+            return MetadataError(detail=exc.detail or "", stage=stage)
+        # Last resort: never hide the real reason behind the generic
+        # "A network error occurred..." phrase when the platform actually
+        # told us something concrete.
+        reason = (exc.detail or "").strip()
+        if reason:
+            return NetworkError(
+                reason[:500],
+                detail=reason,
+                stage=stage,
+            )
+        return exc
 
     @staticmethod
     def _categorize_http_error(exc: Exception) -> Exception:

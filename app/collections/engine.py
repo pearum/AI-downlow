@@ -53,6 +53,7 @@ class CollectionRun:
     run_id: int = 0
 
     def snapshot(self) -> dict[str, Any]:
+        remaining = max(0, self.total - self.completed - self.skipped - self.failed)
         return {
             "url": self.url,
             "collection_id": self.collection_id,
@@ -60,6 +61,7 @@ class CollectionRun:
             "completed": self.completed,
             "skipped": self.skipped,
             "failed": self.failed,
+            "remaining": remaining,
             "output_dir": self.output_dir,
             "finished": self.finished,
         }
@@ -134,13 +136,16 @@ class CollectionEngine:
                     "No collection provider supports this URL."
                 )
             info = provider.analyze_collection(url)
+            collection_id = self.store.upsert_collection(info)
+            self.store.save_items(collection_id, info.items)
             with self._lock:
                 self._current[url] = info
                 self._full_items[url] = list(info.items)
                 self._selected[url] = {i.item_id for i in info.items}
-            collection_id = self.store.upsert_collection(info)
-            self.store.save_items(collection_id, info.items)
-            self.bus.emit("collection_scan_progress", url, info.total_items, info.total_items, 100.0)
+            discovered = info.discovered_items or len(info.items)
+            self.bus.emit(
+                "collection_scan_progress", url, discovered, discovered, 100.0
+            )
             self.bus.emit("collection_scan_ready", url, info)
         except Exception as exc:  # noqa: BLE001
             log.exception("Collection scan failed for %s", url)
@@ -168,9 +173,13 @@ class CollectionEngine:
         next_info = provider.load_more(info)
         with self._lock:
             known = self._full_items.setdefault(url, list(info.items))
-            known.extend(next_info.items)
-            selection = self._selected.setdefault(url, {i.item_id for i in known})
-            for item in next_info.items:
+            existing = {i.item_id for i in known}
+            added = [i for i in next_info.items if i.item_id not in existing]
+            known.extend(added)
+            selection = self._selected.setdefault(
+                url, {i.item_id for i in known}
+            )
+            for item in added:
                 selection.add(item.item_id)
             # surface accumulated state as the "current" info
             merged = CollectionInfo(
@@ -182,15 +191,20 @@ class CollectionEngine:
                 account_username=info.account_username,
                 account_display_name=info.account_display_name,
                 description=info.description,
-                total_items=info.total_items,
-                accessible_items=info.accessible_items,
+                total_items=next_info.total_items,
+                accessible_items=len(known),
+                discovered_items=len(known),
+                loaded_items=len(next_info.items),
                 items=next_info.items,
                 has_more=next_info.has_more,
                 next_cursor=next_info.next_cursor,
-                notice=info.notice,
-                series=info.series,
+                notice=next_info.notice or info.notice,
+                series=next_info.series or info.series,
             )
             self._current[url] = merged
+        col = self.store.get_collection(url)
+        if col is not None:
+            self.store.add_items(int(col["id"]), added)
         self.bus.emit("collection_items_ready", url, next_info)
         return next_info
 
@@ -283,11 +297,11 @@ class CollectionEngine:
         base = Path(self.settings.ensure_download_folder())
         if isinstance(item, QueueItem):
             platform = item.media.platform
-            account = item.account or "Unknown"
+            account = item.account or item.account_display or "Unknown"
             series = item.series
         else:
             platform = item.platform
-            account = item.account_username or "Unknown"
+            account = item.account_username or item.account_display_name or "Unknown"
             series = item.series_name
         parts = [base, platform.display_name]
         parts.append(sanitize_filename(account))
@@ -309,6 +323,27 @@ class CollectionEngine:
         self.manager.start()
         return len(items)
 
+    def download_all(self, url: str) -> int:
+        """Discover the complete accessible collection, then queue everything.
+
+        Repeatedly pages through the provider until ``has_more`` is False so
+        Download All never silently stops at the first page of items.
+        """
+        info = self.current_info(url)
+        if info is None:
+            return 0
+        guard = 0
+        while info.has_more and guard < 200:
+            next_info = self.load_more(url)
+            if next_info is None:
+                break
+            info = next_info
+            guard += 1
+            if not info.has_more:
+                break
+        self.select_all(url)
+        return self.add_to_queue(url)
+
     def _track_run(self, url: str, items: list[QueueItem]) -> None:
         col = self.store.get_collection(url)
         collection_id = int(col["id"]) if col else 0
@@ -316,14 +351,19 @@ class CollectionEngine:
             self.store.update_item_status(
                 collection_id, qi.collection_item_id, "queued"
             )
-        run = CollectionRun(
-            url=url,
-            collection_id=collection_id,
-            total=len(items),
-            output_dir=str(self._output_dir_for(items[0])),
-        )
-        run.run_id = self.store.start_run(collection_id, len(items))
         with self._run_lock:
+            run = self._runs.get(url)
+            if run is None or run.finished:
+                run = CollectionRun(
+                    url=url,
+                    collection_id=collection_id,
+                    total=len(items),
+                    output_dir=str(self._output_dir_for(items[0])),
+                )
+                run.run_id = self.store.start_run(collection_id, len(items))
+            else:
+                run.total += len(items)
+                self.store.update_run_total(run.run_id, run.total)
             self._runs[url] = run
         self.bus.emit("collection_progress", url, run.snapshot())
 
@@ -349,8 +389,10 @@ class CollectionEngine:
             account_username=col["account_username"],
             account_display_name=col["account_display_name"],
             description=col["description"],
-            total_items=len(stored),
+            total_items=int(col.get("total_items") or len(stored)),
             accessible_items=len(stored),
+            discovered_items=len(stored),
+            loaded_items=len(stored),
         )
         items = [self._row_to_item(row, platform) for row in stored]
         info.items = items
@@ -475,6 +517,7 @@ class CollectionEngine:
             platform=platform,
             index=row.get("index_no"),
             account_username=row.get("account_username"),
+            account_display_name=row.get("account_display_name"),
             series_name=row.get("series_name"),
             collection_name=row.get("collection_name"),
             duration=row.get("duration"),

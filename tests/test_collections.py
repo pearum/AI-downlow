@@ -276,6 +276,78 @@ class TestPagination:
 
 
 # ----------------------------------------------------------------------
+# Download All — must page through the whole collection, not just page 1
+# ----------------------------------------------------------------------
+class TestDownloadAll:
+    @pytest.fixture
+    def paged(self, tmp_path):
+        bus = EventBus()
+        registry = ProviderRegistry()
+        registry._providers["tiktok"] = MockProvider()
+        sm = SettingsManager(tmp_path / "cfg.json")
+        sm.update(general={"download_folder": str(tmp_path / "downloads")})
+        manager = DownloadManager(registry, bus, concurrency=1)
+        store = CollectionStore(tmp_path / "c.db")
+        provider = MockCollectionProvider(total=7, page_size=2)
+        engine = CollectionEngine(
+            registry,
+            bus,
+            manager,
+            sm,
+            store=store,
+            collections=CollectionProviderRegistry([provider]),
+        )
+        manager.start()
+        return engine, provider
+
+    def test_download_all_pages_entire_collection(self, paged):
+        engine, provider = paged
+        url = "https://mock.example/big"
+        engine.scan(url)
+        deadline = time.time() + 10
+        while not engine.discovered_items(url) and time.time() < deadline:
+            time.sleep(0.05)
+        queued = engine.download_all(url)
+        assert queued == 7
+        assert len(engine.discovered_items(url)) == 7
+        assert len(engine.selected_ids(url)) == 7
+        assert engine.current_info(url).has_more is False
+
+    def test_download_all_persists_new_pages_to_store(self, paged):
+        engine, provider = paged
+        url = "https://mock.example/big"
+        engine.scan(url)
+        deadline = time.time() + 10
+        while not engine.discovered_items(url) and time.time() < deadline:
+            time.sleep(0.05)
+        engine.download_all(url)
+        deadline = time.time() + 10
+        while (
+            not engine.store.get_collection(url)
+            or len(
+                engine.store.get_items(int(engine.store.get_collection(url)["id"]))
+            )
+            < 7
+        ) and time.time() < deadline:
+            time.sleep(0.05)
+        col = engine.store.get_collection(url)
+        assert col is not None
+        assert len(engine.store.get_items(int(col["id"]))) == 7
+
+    def test_download_all_does_not_duplicate_on_second_call(self, paged):
+        engine, provider = paged
+        url = "https://mock.example/big"
+        engine.scan(url)
+        deadline = time.time() + 10
+        while not engine.discovered_items(url) and time.time() < deadline:
+            time.sleep(0.05)
+        engine.download_all(url)
+        queued_again = engine.download_all(url)
+        assert queued_again == 7
+        assert len(engine.discovered_items(url)) == 7
+
+
+# ----------------------------------------------------------------------
 # Selection
 # ----------------------------------------------------------------------
 class TestSelection:

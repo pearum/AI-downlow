@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS collection_items (
     title TEXT NOT NULL,
     index_no INTEGER,
     account_username TEXT,
+    account_display_name TEXT,
     series_name TEXT,
     collection_name TEXT,
     duration REAL,
@@ -90,6 +91,18 @@ class CollectionStore:
         with self._lock:
             with self._connect() as conn:
                 conn.executescript(_SCHEMA)
+                self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after the initial schema (best-effort)."""
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(collection_items)")
+        }
+        if "account_display_name" not in columns:
+            conn.execute(
+                "ALTER TABLE collection_items "
+                "ADD COLUMN account_display_name TEXT"
+            )
 
     # ------------------------------------------------------------------
     def upsert_collection(self, info: CollectionInfo) -> int:
@@ -159,30 +172,55 @@ class CollectionStore:
                     """
                     INSERT OR REPLACE INTO collection_items
                         (collection_id, item_id, url, title, index_no,
-                         account_username, series_name, collection_name,
-                         duration, thumbnail, upload_date, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         account_username, account_display_name, series_name,
+                         collection_name, duration, thumbnail, upload_date,
+                         status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [
-                        (
-                            collection_id,
-                            item.item_id,
-                            item.url,
-                            item.title,
-                            item.index,
-                            item.account_username,
-                            item.series_name,
-                            item.collection_name,
-                            item.duration,
-                            item.thumbnail,
-                            item.upload_date.isoformat()
-                            if item.upload_date
-                            else None,
-                            item.status.value,
-                        )
-                        for item in items
-                    ],
+                    [self._item_row(collection_id, item) for item in items],
                 )
+
+    def add_items(
+        self, collection_id: int, items: list[CollectionItem]
+    ) -> None:
+        """Insert newly discovered items without touching existing rows.
+
+        Unlike ``save_items`` this never deletes or resets previously saved
+        statuses, so paginated discovery and resume state coexist safely.
+        """
+        if not items:
+            return
+        with self._lock:
+            with self._connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO collection_items
+                        (collection_id, item_id, url, title, index_no,
+                         account_username, account_display_name, series_name,
+                         collection_name, duration, thumbnail, upload_date,
+                         status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [self._item_row(collection_id, item) for item in items],
+                )
+
+    @staticmethod
+    def _item_row(collection_id: int, item: CollectionItem) -> tuple[Any, ...]:
+        return (
+            collection_id,
+            item.item_id,
+            item.url,
+            item.title,
+            item.index,
+            item.account_username,
+            item.account_display_name,
+            item.series_name,
+            item.collection_name,
+            item.duration,
+            item.thumbnail,
+            item.upload_date.isoformat() if item.upload_date else None,
+            item.status.value,
+        )
 
     # ------------------------------------------------------------------
     def get_collection(self, url: str) -> Optional[dict[str, Any]]:
@@ -295,6 +333,14 @@ class CollectionStore:
                     WHERE id=?
                     """,
                     (now, completed, skipped, failed, run_id),
+                )
+
+    def update_run_total(self, run_id: int, total: int) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE collection_runs SET total=? WHERE id=?",
+                    (total, run_id),
                 )
 
     def is_finished(self, url: str) -> bool:

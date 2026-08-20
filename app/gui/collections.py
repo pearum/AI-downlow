@@ -336,10 +336,7 @@ class CollectionsPage(QWidget):
         self.scan_progress.setValue(0)
         self.analyze_button.setEnabled(True)
         self._info = info
-        self.info_label.setText(
-            f"{info.name}   ·   {info.platform.display_name}   ·   "
-            f"Available items: {info.total_items}"
-        )
+        self._refresh_available_label()
         if info.account_username:
             self.info_label.setText(
                 self.info_label.text() + f"   ·   @{info.account_username}"
@@ -465,7 +462,23 @@ class CollectionsPage(QWidget):
         if next_info:
             self._append_items(next_info.items)
             self.load_more_button.setEnabled(next_info.has_more)
+            if self._info is not None:
+                self._info = self.engine.current_info(url)
+            self._refresh_available_label()
             self._refresh_selection_label()
+
+    def _refresh_available_label(self) -> None:
+        info = self._info
+        if info is None:
+            return
+        available = info.accessible_items or info.discovered_items or len(info.items)
+        text = (
+            f"{info.name}   ·   {info.platform.display_name}   ·   "
+            f"Available items: {available}"
+        )
+        if info.has_more:
+            text += "   (more may be available — use Load More)"
+        self.info_label.setText(text)
 
     # ------------------------------------------------------------------
     def _on_add(self, download_now: bool) -> None:
@@ -484,8 +497,7 @@ class CollectionsPage(QWidget):
         url = self._current_url()
         if not url:
             return
-        self.engine.select_all(url)
-        count = self.engine.add_to_queue(url)
+        count = self.engine.download_all(url)
         if count:
             self.scan_status.setObjectName("Success")
             self.scan_status.setText(f"Downloading all {count} item(s).")
@@ -517,7 +529,7 @@ class CollectionsPage(QWidget):
         self._info = info
         self.info_label.setText(
             f"{info.name}   ·   {info.platform.display_name}   ·   "
-            f"Total saved items: {info.total_items}"
+            f"Saved items: {info.accessible_items or info.discovered_items or len(info.items)}"
         )
         self._append_items(info.items)
         for button in (

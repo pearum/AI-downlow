@@ -60,6 +60,11 @@ class QueueItem:
         return extra.get("account_username") or ""
 
     @property
+    def account_display(self) -> str:
+        extra = self.media.extra.get("collection") or {}
+        return extra.get("account_display_name") or ""
+
+    @property
     def series(self) -> str:
         extra = self.media.extra.get("collection") or {}
         return extra.get("series_name") or ""

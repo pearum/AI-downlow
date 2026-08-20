@@ -103,8 +103,15 @@ class CollectionInfo:
     account_username: Optional[str] = None
     account_display_name: Optional[str] = None
     description: Optional[str] = None
+    #: Platform-reported total when the provider exposes it (0 = unknown).
     total_items: int = 0
+    #: Items actually discovered so far (cumulative across pages).
     accessible_items: int = 0
+    #: Alias of ``accessible_items`` — cumulative discovered count.
+    discovered_items: int = 0
+    #: Items loaded in the current page.
+    loaded_items: int = 0
+    #: The current page of items (see ``loaded_items``).
     items: list[CollectionItem] = field(default_factory=list)
     has_more: bool = False
     next_cursor: Optional[str] = None

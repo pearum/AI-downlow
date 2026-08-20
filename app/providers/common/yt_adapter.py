@@ -11,13 +11,12 @@ Compliance notes:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from ...core.errors import (
     AppError,
@@ -39,8 +38,6 @@ from .env import API_KEYS
 
 log = logging.getLogger(__name__)
 
-_OPTS_CACHE: dict[str, Any] = {}
-
 
 def _user_agent() -> str:
     return (
@@ -49,16 +46,88 @@ def _user_agent() -> str:
     )
 
 
-def _base_opts(provider: str) -> dict[str, Any]:
-    key = f"{provider}:base"
-    if key in _OPTS_CACHE:
-        return _OPTS_CACHE[key]
+def _resolve_js_runtime() -> tuple[str, str] | None:
+    """Locate a JavaScript runtime yt-dlp can use to solve YouTube challenges.
+
+    Search order:
+      1. Explicitly configured runtime (``YTDLP_JS_RUNTIME`` env var, either a
+         bare command name resolved through PATH or an absolute path).
+      2. ``deno`` (highest priority in yt-dlp).
+      3. ``node``.
+
+    Returns ``(name, path)`` or ``None`` when no usable runtime is present.
+    Never hard-codes an invalid path — yt-dlp is only told about a runtime
+    that actually exists.
+    """
+    configured = os.environ.get("YTDLP_JS_RUNTIME", "").strip()
+    if configured:
+        path = configured
+        if not (os.sep in path or (os.altsep and os.altsep in path)):
+            path = shutil.which(configured) or ""
+        if path and Path(path).is_file():
+            name = os.path.basename(path).lower()
+            if name.startswith("deno"):
+                return "deno", path
+            if name.startswith("node"):
+                return "node", path
+            return "node", path
+        log.warning("Configured JS runtime not found: %s", configured)
+
+    for name in ("deno", "node"):
+        found = shutil.which(name)
+        if found and Path(found).is_file():
+            return name, found
+    return None
+
+
+def _is_playlist_url(url: str, platform: Platform) -> bool:
+    """Best-effort guess whether a URL points at a collection, not a video.
+
+    Single-video URLs must NOT pull the surrounding playlist into an
+    analysis/download (``noplaylist``), while playlist / channel / profile
+    URLs must keep playlist extraction enabled.
+    """
+    lowered = url.lower()
+    if platform == Platform.YOUTUBE:
+        if any(
+            marker in lowered
+            for marker in ("watch?v=", "youtu.be/", "/shorts/", "/embed/", "live/")
+        ):
+            return False
+        return True
+    if platform == Platform.TIKTOK:
+        if any(host in lowered for host in ("vm.tiktok.com", "vt.tiktok.com")):
+            return False
+        path = urlparse(url).path
+        if "/video/" in path:
+            return False
+        return "@" in path or "/collection/" in path
+    if platform == Platform.FACEBOOK:
+        if any(
+            marker in lowered
+            for marker in ("/watch", "/videos/", "/reel/", "/photo", "video_id=")
+        ):
+            return False
+        return True
+    return False
+
+
+def _build_yt_dlp_options(
+    provider: str, *, download: bool = False, playlist: bool = False
+) -> dict[str, Any]:
+    """Shared yt-dlp options used consistently for extraction and download.
+
+    ``remote_components`` always advertises EJS support so yt-dlp can fetch
+    the challenge solver from GitHub when the bundled ``yt-dlp-ejs`` package
+    is not present. ``js_runtimes`` is only populated when a real JavaScript
+    runtime exists on this machine — an invalid runtime path is never placed
+    into the options.
+    """
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": False,
-        "extract_flat": "in_playlist",
+        "skip_download": not download,
+        "noplaylist": not playlist,
         "http_headers": {"User-Agent": _user_agent()},
         "socket_timeout": 30,
         "retries": 3,
@@ -66,14 +135,15 @@ def _base_opts(provider: str) -> dict[str, Any]:
         "nocheckcertificate": False,
         "cachedir": False,
         "logger": _YtLogger(),
-        # Allow yt-dlp to fetch the EJS challenge solver so YouTube's
-        # "n" challenge can be solved when a JS runtime (deno/node) exists.
         "remote_components": {"ejs:github"},
     }
+    runtime = _resolve_js_runtime()
+    if runtime:
+        name, path = runtime
+        opts["js_runtimes"] = {name: {"path": path}}
     api_key = API_KEYS.get(provider)
     if api_key:
         opts["extractor_args"] = {provider: {"api_key": [api_key]}}
-    _OPTS_CACHE[key] = opts
     return opts
 
 
@@ -162,11 +232,47 @@ def check_ffmpeg(configured_path: str = "") -> str:
     return found
 
 
-def extract_info(url: str, platform: Platform) -> dict[str, Any]:
-    """Fetch raw info dict for a URL using yt-dlp."""
+def extract_info(
+    url: str,
+    platform: Platform,
+    *,
+    download: bool = False,
+    playlist: bool | None = None,
+) -> dict[str, Any]:
+    """Fetch raw info dict for a URL using yt-dlp.
+
+    ``playlist=None`` auto-detects whether the URL is a collection so single
+    videos are never expanded into the playlist they belong to.
+    """
     yt = _resolve_download_backend()
-    opts = dict(_base_opts(platform.value))
-    opts["skip_download"] = True
+    if playlist is None:
+        playlist = _is_playlist_url(url, platform)
+    opts = _build_yt_dlp_options(platform.value, download=download, playlist=playlist)
+    if not download:
+        opts["extract_flat"] = "in_playlist"
+    try:
+        with yt.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=download)
+    except yt.utils.DownloadError as exc:
+        raise _translate_download_error(exc, stage="Extracting media") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise NetworkError(detail=str(exc), stage="Extracting media") from exc
+
+
+def extract_playlist_page(
+    url: str, platform: Platform, start: int, count: int
+) -> dict[str, Any]:
+    """Fetch one real page of a playlist / channel / profile via yt-dlp.
+
+    Uses yt-dlp's native ``playlist_items`` range so every "Load More" call
+    re-extracts only the requested slice of the collection. This is genuine
+    pagination — no synthetic tokens are invented.
+    """
+    yt = _resolve_download_backend()
+    opts = _build_yt_dlp_options(platform.value, download=False, playlist=True)
+    opts["extract_flat"] = "in_playlist"
+    if count and count > 0:
+        opts["playlist_items"] = f"{start + 1}-{start + count}"
     try:
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
@@ -180,6 +286,15 @@ def _translate_download_error(
     exc: Exception, stage: str = "Downloading"
 ) -> Exception:
     text = str(exc).lower()
+    if (
+        "http error 401" in text
+        or "http 401" in text
+        or "unauthorized" in text
+        or "authentication" in text
+    ):
+        from ...core.errors import AuthenticationError
+
+        return AuthenticationError(detail=str(exc), stage=stage)
     if (
         "login" in text
         or "sign in" in text
@@ -207,6 +322,7 @@ def _translate_download_error(
         or "removed" in text
         or "not available" in text
         or "deleted" in text
+        or "this video has been" in text
     ):
         from ...core.errors import ContentUnavailableError
 
@@ -443,20 +559,19 @@ class StreamDownloader:
                 )
             )
 
-        opts: dict[str, Any] = {
-            "quiet": True,
-            "no_warnings": True,
-            "outtmpl": {"default": target},
-            "format": format_selector,
-            "merge_output_format": _merge_ext(self.output_format),
-            "http_headers": {"User-Agent": _user_agent()},
-            "socket_timeout": 30,
-            "retries": 3,
-            "fragment_retries": 3,
-            "cachedir": False,
-            "logger": _YtLogger(),
-            "noprogress": True,
-        }
+        from ...core.models import Platform as _Platform
+        from .url_utils import detect_platform
+
+        detected = detect_platform(self.url)
+        provider = detected.value if detected != _Platform.UNKNOWN else ""
+
+        opts: dict[str, Any] = _build_yt_dlp_options(
+            provider, download=True, playlist=False
+        )
+        opts["outtmpl"] = {"default": target}
+        opts["format"] = format_selector
+        opts["merge_output_format"] = _merge_ext(self.output_format)
+        opts["noprogress"] = True
         if ffmpeg:
             opts["ffmpeg_location"] = str(Path(ffmpeg).parent)
         if self.embed_metadata:
